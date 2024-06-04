@@ -29,8 +29,10 @@ import configparser
 import numpy as np
 import logging
 
+from torch.utils.tensorboard import SummaryWriter
+
 # import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 custom_encoder = True
 
 
@@ -78,7 +80,7 @@ class MyDataset(torch.utils.data.Dataset):
         #*  se le debería pasar a nuestro FVAE encoder, y el IP-Adapter se encarga de aprender la relación
         item = self.data[idx] 
         text = item["text"]
-        image_file = item["image_file"]
+        image_file = item["image"]
         
         # read image
         raw_image = Image.open(os.path.join(self.image_root_path, image_file))
@@ -329,6 +331,9 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     
+    writer_dir = f"{args.output_dir}/tensorboard_logs"
+    writer = SummaryWriter(writer_dir)
+
     # Save args into an external json file
     path_to_metadata = f"{args.output_dir}/config.json"
     with open(path_to_metadata, 'w') as f:
@@ -445,7 +450,8 @@ def main():
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0] # Batch size
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(699, 700, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -505,6 +511,8 @@ def main():
                         ct, epoch, step, load_data_time, time.perf_counter() - begin, avg_loss)
                     logging.info(log_msg)
                     print(log_msg)
+                                                              # vv number of steps vv
+                writer.add_scalar('batch_loss', avg_loss, epoch*len(train_dataloader)+step)
             
             global_step += 1
             

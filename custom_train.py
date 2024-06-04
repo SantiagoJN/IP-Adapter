@@ -37,6 +37,9 @@ import matplotlib.pyplot as plt
 from torch.autograd import Variable
 from torchviz import make_dot, make_dot_from_trace
 
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+
 # import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 custom_encoder = True
@@ -359,6 +362,11 @@ def main():
     relevants_text = configs_dict['relevant'] # Raw text that contains the relevant dimensions' identifiers
     relevant_dimensions = np.array([int(num.strip()) for num in relevants_text.split(',')]) # Text to array
 
+    now = datetime.now() 
+    timestamp = now.strftime("%Y-%d-%m, %H.%M.%S")
+    writer_dir = f"runs/{timestamp}"
+    writer = SummaryWriter(writer_dir)
+
     # relevant_dimensions = [3, 6, 7, 11, 13, 17, 19]
     # print(f'[WARNING] Selecting the following dimensions as relevant.\nMake sure this is correct before training\n{relevant_dimensions}')
 
@@ -391,6 +399,7 @@ def main():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     """
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler") # load this for sampling the noise inside ip_adapter
     # load controlnet
     controlnet_model_path = "/media/raid/santiagojn/IPAdapter/control_v11f1p_sd15_depth"
     controlnet = ControlNetModel.from_pretrained(controlnet_model_path, torch_dtype=torch.float16)
@@ -435,7 +444,7 @@ def main():
     
     # ! Very careful with what we set to require grad or not
     pipe.unet.requires_grad_(False)
-    # vae.requires_grad_(False)
+    vae.requires_grad_(False)
     # text_encoder.requires_grad_(False) #?
     
     image_encoder.requires_grad_(False)
@@ -494,9 +503,11 @@ def main():
     # text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
     
+    adapter_modules = torch.nn.ModuleList(ip_adapter.pipe.unet.attn_processors.values())
+    # pipe_controlnet = ip_adapter.pipe.controlnet # ? We should also account for the controlnet module, no? --> handled in the attention processors? --> no, its condition is already handled in the input of the unet :)
     
     # optimizer
-    params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  ip_adapter.adapter_modules.parameters())
+    params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(),  adapter_modules.parameters())#, pipe_controlnet.parameters()) # ! This should be properly set; otherwise, backpropagation doesn't work
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # dataloader
@@ -567,8 +578,10 @@ def main():
                 bsz = batch["images"].shape[0]
                 # print(f'@@@@@@BATCH SIZE: {bsz}')
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=accelerator.device)
-                timesteps = timesteps.long()
+                # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=accelerator.device)
+                # timesteps = timesteps.long()
+
+                
                 
                 #! Make sure that images look like they should before training a model
                 # plt.imshow((((batch["control_images"][0]).permute(1,2,0)).detach()).cpu())
@@ -582,28 +595,31 @@ def main():
                 # exit()
 
                 # Here we call the forward, hoping that it returns a noise and its estimation
-                noise, noise_pred = ip_adapter.compute_noises(
+                noise, noise_pred, timestep = ip_adapter.compute_noises(
                         pil_image=batch["pil_images"], 
-                        image=batch["images"],
-                        control_image=batch["control_images"],
-                        mask_image=batch["mask_images"], 
+                        image=batch["images"], # " image batch to be used as the starting point "
+                        control_image=batch["control_images"],  # " The ControlNet input condition to provide guidance to the `unet` for generation "
+                        mask_image=batch["mask_images"],  # " image batch to mask `image` "
                         seed=42, 
-                        num_samples=1, # we send just 1 batch of n samples (otherwise it replicates internal variables..)
+                        num_samples=1, # we send just 1 batch of n samples (otherwise it replicates internal variables..) # ! Change when it works
                         num_inference_steps=30, 
                         controlnet_conditioning_scale=0.99, 
-                        timesteps=timesteps)
+                        # timesteps=timesteps,
+                        noise_scheduler=noise_scheduler,
+                        weight_dtype=weight_dtype,
+                        vae=vae)
 
-                print(f'Returned from compute_noises with requires grads: noise - {noise.requires_grad} and noise_pred - {noise_pred.requires_grad}')
-                print(f'Noise shape: {noise.shape}') # [16, 4, 32, 32] => [bs, unet_shape, (latent_shape)]
+                # print(f'Returned from compute_noises with requires grads: noise - {noise.requires_grad} and noise_pred - {noise_pred.requires_grad}')
+                # print(f'Noise shape: {noise.shape}') # [16, 4, 32, 32] => [bs, unet_shape, (latent_shape)]
                 # print(f'################## Calling make_dot() function')
                 # make_dot(noise_pred, params=dict(ip_adapter.pipe.unet.named_parameters()), show_attrs=True, show_saved=True)
 
                 #? "computes the average squared difference between pixel values in the generated image and the ground truth image"
                 # Computes the noise reconstructed at certain "step" (defined at the beginning of the loop)
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                print(f'Loss with type {loss.type}, requires grad: {loss.requires_grad}')
-                loss = Variable(loss, requires_grad = True)
-                print(f'Loss changed type to {loss.type}')
+                # print(f'Loss with type {loss.type}, requires grad: {loss.requires_grad}')
+                loss = Variable(loss, requires_grad = True) # otherwise we get nan's after the first iteration (?)
+                # print(f'Loss changed type to {loss.type}')
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean().item()
                 
@@ -612,21 +628,27 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
 
+
                 if accelerator.is_main_process:
-                    ct = datetime.datetime.now()
+                    ct = datetime.now()
                     log_msg = "[{}] Epoch {}, step {}, timestep {}, data_time: {:.4f}, time: {:.4f}, step_loss: {}".format(
-                        ct, epoch, step, timesteps[0], load_data_time, time.perf_counter() - begin, avg_loss)
+                        ct, epoch, step, timestep, load_data_time, time.perf_counter() - begin, avg_loss)
                     logging.info(log_msg)
                     print(log_msg)
             
             global_step += 1
             
             begin = time.perf_counter()
+        
+        # Profiling
+        writer.add_scalar('loss', avg_loss, epoch)
 
         if epoch % args.save_epochs == 0 and epoch != 0:
             save_path = os.path.join(args.output_dir, f"checkpoint-{epoch}")
             print(f'Saving in path {save_path}')
             accelerator.save_state(save_path, safe_serialization=False) # ! https://github.com/tencent-ailab/IP-Adapter/issues/263
+    
+    writer.close() # Make sure it is closed properly
             
                 
 if __name__ == "__main__":
