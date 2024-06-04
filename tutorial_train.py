@@ -17,13 +17,37 @@ from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
-from ip_adapter.ip_adapter import ImageProjModel
+from ip_adapter.ip_adapter import ImageProjModel, IPAdapterTRAIN
 from ip_adapter.utils import is_torch2_available
 if is_torch2_available():
     from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
+import datetime
+import configparser
+import numpy as np
+import logging
+
+# import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+custom_encoder = True
+
+
+# From https://stackoverflow.com/questions/52988876/how-can-i-visualize-what-happens-during-loss-backward
+def getBack(var_grad_fn):
+    print(var_grad_fn)
+    for n in var_grad_fn.next_functions:
+        if n[0]:
+            try:
+                tensor = getattr(n[0], 'variable')
+                print(n[0])
+                print('Tensor with grad found:', tensor)
+                print(' - gradient:', tensor.grad)
+                print()
+            except AttributeError as e:
+                getBack(n[0])
+                
 
 # Dataset
 class MyDataset(torch.utils.data.Dataset):
@@ -48,7 +72,10 @@ class MyDataset(torch.utils.data.Dataset):
         ])
         self.clip_image_processor = CLIPImageProcessor()
         
+    # TODO: Habrá que devolver también la imagen de "estilo"
     def __getitem__(self, idx):
+        #* Lo único que queremos usar para condicionar nuestro adapter es la imagen renderizada. Luego esa imagen
+        #*  se le debería pasar a nuestro FVAE encoder, y el IP-Adapter se encarga de aprender la relación
         item = self.data[idx] 
         text = item["text"]
         image_file = item["image_file"]
@@ -57,7 +84,8 @@ class MyDataset(torch.utils.data.Dataset):
         raw_image = Image.open(os.path.join(self.image_root_path, image_file))
         image = self.transform(raw_image.convert("RGB"))
         clip_image = self.clip_image_processor(images=raw_image, return_tensors="pt").pixel_values
-        
+        # clip_image = image
+
         # drop
         drop_image_embed = 0
         rand_num = random.random()
@@ -94,6 +122,7 @@ def collate_fn(data):
     clip_images = torch.cat([example["clip_image"] for example in data], dim=0)
     drop_image_embeds = [example["drop_image_embed"] for example in data]
 
+    # print(f'¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬clip_images:{clip_images.shape}')
     return {
         "images": images,
         "text_input_ids": text_input_ids,
@@ -112,12 +141,19 @@ class IPAdapter(torch.nn.Module):
 
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
+    
 
+    #* encoder_hidden_states -> text embedding
+    #* image_embeds -> image embedding
     def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds):
-        ip_tokens = self.image_proj_model(image_embeds)
+        ip_tokens = self.image_proj_model(image_embeds) # ! FVAE Encoder here
         encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
         # Predict the noise residual
         noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        # print(f'Ip tokens: {ip_tokens.shape}')
+        # print(f'Noisy latents: {noisy_latents.shape}')
+        # print(f'Noise pred shape after UNET: {noise_pred.shape}')
+        
         return noise_pred
 
     def load_from_checkpoint(self, ckpt_path: str):
@@ -176,8 +212,8 @@ def parse_args():
         "--image_encoder_path",
         type=str,
         default=None,
-        required=True,
-        help="Path to CLIP image encoder",
+        required=True,              # ! <<<<<<<<
+        help="Path to CLIP image encoder",  # ! This should be changed ! 
     )
     parser.add_argument(
         "--output_dir",
@@ -230,6 +266,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--save_epochs",
+        type=int,
+        default=50,
+        help=(
+            "Save a checkpoint of the training state every X epochs"
+        ),
+    )
+    parser.add_argument(
         "--mixed_precision",
         type=str,
         default=None,
@@ -261,7 +305,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     logging_dir = Path(args.output_dir, args.logging_dir)
+    # Get the relevant dimensions from the config file
+    config = configparser.RawConfigParser()
+    config.read('/home/santiagojn/IP-Adapter/config.txt')
+    configs_dict = dict(config.items('Configs'))
+    relevants_text = configs_dict['relevant'] # Raw text that contains the relevant dimensions' identifiers
+    relevant_dimensions = np.array([int(num.strip()) for num in relevants_text.split(',')]) # Text to array
+
+    # relevant_dimensions = [3, 6, 7, 11, 13, 17, 19]
+    print(f'[WARNING] Selecting the following dimensions as relevant.\nMake sure this is correct before training\n{relevant_dimensions}')
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
@@ -274,6 +328,15 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Save args into an external json file
+    path_to_metadata = f"{args.output_dir}/config.json"
+    with open(path_to_metadata, 'w') as f:
+        json.dump(vars(args), f, indent=4, sort_keys=True) # Save hyperparameters in case we want to check them later
+    
+    logging.basicConfig(filename=f'{args.output_dir}/run.log', filemode='w', format='%(asctime)s - %(message)s', level=logging.INFO)
+    logging.info('Start training...')
+    logging.info(f'Using image encoder in path {args.image_encoder_path}')
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -281,7 +344,18 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+
+    if custom_encoder:
+        image_encoder = torch.hub.load('/media/raid/santiagojn/IPAdapter/disentangling-vae-master', # hub config location
+                        'latent_extractor', 
+                        ckpt_path=args.image_encoder_path, # encoder checkpoint
+                        source='local')
+        emb_dim = len(relevant_dimensions)
+    else:
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path) # ! FVAE Encoder
+        emb_dim = image_encoder.config.projection_dim
+
+    # image_encoder.eval().cuda()
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
@@ -291,7 +365,8 @@ def main():
     #ip-adapter
     image_proj_model = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
-        clip_embeddings_dim=image_encoder.config.projection_dim,
+        # clip_embeddings_dim=image_encoder.config.projection_dim, # ! <<<<<<<<<<<<<< 20D?
+        clip_embeddings_dim=emb_dim,
         clip_extra_context_tokens=4,
     )
     # init adapter modules
@@ -320,8 +395,13 @@ def main():
     unet.set_attn_processor(attn_procs)
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     
+    # from ZeST: ip_model = IPAdapterXL(pipe, image_encoder_path, ip_ckpt, device)
+    # unet -> pipe (luego ya nos encargamos de sacar el noise)
+    # image_proj_model -> alternative implementation with image_encoder_path
+    # adapter_modules lo he metido nuevo en la clase padre IPAdapter, porque lo quiere luego el optimizer
     ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
-    
+    # ip_adapter = IPAdapterTRAIN(pipe, image_encoder_path, ip_ckpt, device, adapter_modules=adapter_modules)
+
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -348,9 +428,10 @@ def main():
     
     # Prepare everything with our `accelerator`.
     ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
+    print(f'[INFO] Training during {len(train_dataloader)} batches of {args.train_batch_size} size; around {len(train_dataloader)*args.train_batch_size} samples.')
     
     global_step = 0
-    for epoch in range(0, args.num_train_epochs):
+    for epoch in range(1, args.num_train_epochs+1):
         begin = time.perf_counter()
         for step, batch in enumerate(train_dataloader):
             load_data_time = time.perf_counter() - begin
@@ -362,7 +443,7 @@ def main():
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+                bsz = latents.shape[0] # Batch size
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
@@ -372,7 +453,15 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
                 with torch.no_grad():
-                    image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
+                    if custom_encoder:
+                        image_embeds, _ = image_encoder(batch["images"].to(accelerator.device, dtype=weight_dtype)) # get the returned *mean*
+                        image_embeds = image_embeds[:,relevant_dimensions] # Removing _irrelevant_ dimensions
+                    else:
+                        image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds # ! Ver qué saca aquí
+                    # print(f'~~~~~~~~~~~~~~~~~~~~~~~~~~~{(batch["clip_images"]).shape}')
+                    
+                    # print(f'IMAGE EMBEDS({image_embeds.shape}): {image_embeds}')
+                    # exit()
                 image_embeds_ = []
                 for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
                     if drop_image_embed == 1:
@@ -384,10 +473,24 @@ def main():
                 with torch.no_grad():
                     encoder_hidden_states = text_encoder(batch["text_input_ids"].to(accelerator.device))[0]
                 
+                # print(f'BS: {args.train_batch_size}')
+                # print(f'Noise: {noise}')
                 noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds)
         
+                """     For creating the network graph!
+                    input_names = ['input']
+                    output_names = ['noise_pred']
+                    X = (noisy_latents, timesteps, encoder_hidden_states, image_embeds)
+                    torch.onnx.export(ip_adapter, X, 'tutorial_train.onnx', input_names=input_names, output_names=output_names)
+                    print(f'vvvvvvvvvvvvvvvvvSuccessfully ended the torch onnx export!')
+                    exit()
+                """
+
+
+                #? "computes the average squared difference between pixel values in the generated image and the ground truth image"
+                # Computes the noise reconstructed at certain "step" (defined at the beginning of the loop)
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-            
+                
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean().item()
                 
@@ -397,16 +500,21 @@ def main():
                 optimizer.zero_grad()
 
                 if accelerator.is_main_process:
-                    print("Epoch {}, step {}, data_time: {}, time: {}, step_loss: {}".format(
-                        epoch, step, load_data_time, time.perf_counter() - begin, avg_loss))
+                    ct = datetime.datetime.now()
+                    log_msg = "[{}] Epoch {}, step {}, data_time: {}, time: {}, step_loss: {}".format(
+                        ct, epoch, step, load_data_time, time.perf_counter() - begin, avg_loss)
+                    logging.info(log_msg)
+                    print(log_msg)
             
             global_step += 1
             
-            if global_step % args.save_steps == 0:
-                save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                accelerator.save_state(save_path)
-            
             begin = time.perf_counter()
+
+        if epoch % args.save_epochs == 0 and epoch != 0:
+            save_path = os.path.join(args.output_dir, f"checkpoint-{epoch}")
+            print(f'Saving in path {save_path}')
+            accelerator.save_state(save_path, safe_serialization=False) # ! https://github.com/tencent-ailab/IP-Adapter/issues/263
+            
                 
 if __name__ == "__main__":
     main()    
