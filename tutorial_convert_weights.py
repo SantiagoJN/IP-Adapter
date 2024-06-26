@@ -1,5 +1,5 @@
 import torch
-path_root = "/media/raid/santiagojn/IPAdapter/results/test_masked-ghosts_2/checkpoint-500/"
+path_root = "/media/raid/santiagojn/IPAdapter/results/test_train_serrano_custom_encoder4/checkpoint-130000/"
 ckpt = path_root + "pytorch_model.bin"
 sd = torch.load(ckpt, map_location="cpu")
 image_proj_sd = {}

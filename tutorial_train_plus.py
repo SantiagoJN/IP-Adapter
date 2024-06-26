@@ -24,6 +24,16 @@ if is_torch2_available():
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
+import datetime
+import configparser
+import numpy as np
+import logging
+
+from torch.utils.tensorboard import SummaryWriter
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+print(f'Using {torch.cuda.get_device_name(0)}')
+custom_encoder = True
 
 # Dataset
 class MyDataset(torch.utils.data.Dataset):
@@ -38,7 +48,7 @@ class MyDataset(torch.utils.data.Dataset):
         self.ti_drop_rate = ti_drop_rate
         self.image_root_path = image_root_path
 
-        self.data = json.load(open(json_file)) # list of dict: [{"image_file": "1.png", "text": "A dog"}]
+        self.data = json.load(open(json_file)) # list of dict: [{"image": "1.png", "text": "A dog"}]
 
         self.transform = transforms.Compose([
             transforms.Resize(self.size, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -51,7 +61,7 @@ class MyDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = self.data[idx] 
         text = item["text"]
-        image_file = item["image_file"]
+        image_file = item["image"]
         
         # read image
         raw_image = Image.open(os.path.join(self.image_root_path, image_file))
@@ -279,6 +289,19 @@ def main():
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
 
+    # Get the relevant dimensions from the config file
+    config = configparser.RawConfigParser()
+    config.read('/home/santiagojn/IP-Adapter/config.txt')
+    configs_dict = dict(config.items('Configs'))
+    relevants_text = configs_dict['relevant'] # Raw text that contains the relevant dimensions' identifiers
+    relevant_dimensions = np.array([int(num.strip()) for num in relevants_text.split(',')]) # Text to array
+
+    # relevant_dimensions = [3, 6, 7, 11, 13, 17, 19]
+    if custom_encoder:
+        print(f'[WARNING] Selecting the following dimensions as relevant.\nMake sure this is correct before training\n{relevant_dimensions}')
+    else:
+        print(f'Using default CLIP image embedder; not selecting any _relevant_ dimensions')
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
@@ -290,6 +313,18 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+    
+    writer_dir = f"{args.output_dir}/tensorboard_logs"
+    writer = SummaryWriter(writer_dir)
+
+    # Save args into an external json file
+    path_to_metadata = f"{args.output_dir}/config.json"
+    with open(path_to_metadata, 'w') as f:
+        json.dump(vars(args), f, indent=4, sort_keys=True) # Save hyperparameters in case we want to check them later
+    
+    logging.basicConfig(filename=f'{args.output_dir}/run.log', filemode='w', format='%(asctime)s - %(message)s', level=logging.INFO)
+    logging.info('Start training...')
+    logging.info(f'Using image encoder in path {args.image_encoder_path}')
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -297,7 +332,18 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    
+    if custom_encoder:
+        image_encoder = torch.hub.load('/media/raid/santiagojn/IPAdapter/disentangling-vae-master', # hub config location
+                        'latent_extractor', 
+                        ckpt_path=args.image_encoder_path, # encoder checkpoint
+                        source='local')
+        emb_dim = len(relevant_dimensions)
+    else:
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path) # ! FVAE Encoder
+        emb_dim = image_encoder.config.projection_dim
+    
+    
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
@@ -311,7 +357,8 @@ def main():
         dim_head=64,
         heads=12,
         num_queries=args.num_tokens,
-        embedding_dim=image_encoder.config.hidden_size,
+        # embedding_dim=image_encoder.config.hidden_size,
+        embedding_dim=emb_dim, # ! KEEP AN EYE ON THIS.. (look at the details of the plus implementation?)
         output_dim=unet.config.cross_attention_dim,
         ff_mult=4
     )
@@ -342,7 +389,8 @@ def main():
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     
     ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
-    
+    print(f"!!!! Accelerator device is {accelerator.device}")
+
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -369,10 +417,13 @@ def main():
     
     # Prepare everything with our `accelerator`.
     ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
+
+    print(f'[INFO] Training *IP-A plus* during {len(train_dataloader)} batches of {args.train_batch_size} size; around {len(train_dataloader)*args.train_batch_size} samples.')
     
     global_step = 0
-    for epoch in range(0, args.num_train_epochs):
+    for epoch in range(1, args.num_train_epochs+1):
         begin = time.perf_counter()
+        mean_epoch_loss = 0
         for step, batch in enumerate(train_dataloader):
             load_data_time = time.perf_counter() - begin
             with accelerator.accumulate(ip_adapter):
@@ -400,7 +451,12 @@ def main():
                         clip_images.append(clip_image)
                 clip_images = torch.stack(clip_images, dim=0)
                 with torch.no_grad():
-                    image_embeds = image_encoder(clip_images.to(accelerator.device, dtype=weight_dtype), output_hidden_states=True).hidden_states[-2]
+                    # ! DIFFERENT FROM THE VANILLA VERSION -----------------------------------------------------------------v
+                    if custom_encoder:
+                        image_embeds, _ = image_encoder(batch["images"].to(accelerator.device, dtype=weight_dtype)) # get the returned *mean*
+                        image_embeds = image_embeds[:,relevant_dimensions] # Removing _irrelevant_ dimensions
+                    else:
+                        image_embeds = image_encoder(clip_images.to(accelerator.device, dtype=weight_dtype), output_hidden_states=True).hidden_states[-2]
             
                 with torch.no_grad():
                     encoder_hidden_states = text_encoder(batch["text_input_ids"].to(accelerator.device))[0]
@@ -418,16 +474,27 @@ def main():
                 optimizer.zero_grad()
 
                 if accelerator.is_main_process:
-                    print("Epoch {}, step {}, data_time: {}, time: {}, step_loss: {}".format(
-                        epoch, step, load_data_time, time.perf_counter() - begin, avg_loss))
+                    ct = datetime.datetime.now()
+                    log_msg = "[{}] Epoch {}, step {}, data_time: {}, time: {}, step_loss: {}".format(
+                        ct, epoch, step, load_data_time, time.perf_counter() - begin, avg_loss)
+                    logging.info(log_msg)
+                    print(log_msg)
+                writer.add_scalar('batch_loss', avg_loss, (epoch-1)*len(train_dataloader)+step)
+                # print(f'=======Writing batch loss no. {(epoch-1)*len(train_dataloader)+step}')
+                mean_epoch_loss += avg_loss
             
             global_step += 1
             
             if global_step % args.save_steps == 0:
+                print(f'-----Saving checkpoint at step {global_step}')
                 save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                accelerator.save_state(save_path)
-            
+                accelerator.save_state(save_path, safe_serialization=False) 
+
             begin = time.perf_counter()
+        
+        
+        mean_epoch_loss /= len(train_dataloader)
+        writer.add_scalar('epoch_loss', mean_epoch_loss, epoch-1)
                 
 if __name__ == "__main__":
     main()    

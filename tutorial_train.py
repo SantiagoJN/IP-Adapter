@@ -317,7 +317,10 @@ def main():
     relevant_dimensions = np.array([int(num.strip()) for num in relevants_text.split(',')]) # Text to array
 
     # relevant_dimensions = [3, 6, 7, 11, 13, 17, 19]
-    print(f'[WARNING] Selecting the following dimensions as relevant.\nMake sure this is correct before training\n{relevant_dimensions}')
+    if custom_encoder:
+        print(f'[WARNING] Selecting the following dimensions as relevant.\nMake sure this is correct before training\n{relevant_dimensions}')
+    else:
+        print(f'Using default CLIP image embedder; not selecting any _relevant_ dimensions')
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
@@ -406,7 +409,8 @@ def main():
     # adapter_modules lo he metido nuevo en la clase padre IPAdapter, porque lo quiere luego el optimizer
     ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
     # ip_adapter = IPAdapterTRAIN(pipe, image_encoder_path, ip_ckpt, device, adapter_modules=adapter_modules)
-
+    print(f"!!!! Accelerator device is {accelerator.device}")
+    
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -433,11 +437,12 @@ def main():
     
     # Prepare everything with our `accelerator`.
     ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
-    print(f'[INFO] Training during {len(train_dataloader)} batches of {args.train_batch_size} size; around {len(train_dataloader)*args.train_batch_size} samples.')
+    print(f'[INFO] Training *default IP-Adapter* during {len(train_dataloader)} batches of {args.train_batch_size} size; around {len(train_dataloader)*args.train_batch_size} samples.')
     
     global_step = 0
     for epoch in range(1, args.num_train_epochs+1):
         begin = time.perf_counter()
+        mean_epoch_loss = 0
         for step, batch in enumerate(train_dataloader):
             load_data_time = time.perf_counter() - begin
             with accelerator.accumulate(ip_adapter):
@@ -450,8 +455,8 @@ def main():
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0] # Batch size
                 # Sample a random timestep for each image
-                # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = torch.randint(699, 700, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                # timesteps = torch.randint(699, 700, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -463,7 +468,7 @@ def main():
                         image_embeds, _ = image_encoder(batch["images"].to(accelerator.device, dtype=weight_dtype)) # get the returned *mean*
                         image_embeds = image_embeds[:,relevant_dimensions] # Removing _irrelevant_ dimensions
                     else:
-                        image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds # ! Ver qué saca aquí
+                        image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds # ! VANILLA VERSION
                     # print(f'~~~~~~~~~~~~~~~~~~~~~~~~~~~{(batch["clip_images"]).shape}')
                     
                     # print(f'IMAGE EMBEDS({image_embeds.shape}): {image_embeds}')
@@ -512,17 +517,31 @@ def main():
                     logging.info(log_msg)
                     print(log_msg)
                                                               # vv number of steps vv
-                writer.add_scalar('batch_loss', avg_loss, epoch*len(train_dataloader)+step)
+                writer.add_scalar('batch_loss', avg_loss, (epoch-1)*len(train_dataloader)+step)
+                # print(f'=======Writing batch loss no. {(epoch-1)*len(train_dataloader)+step}')
+                mean_epoch_loss += avg_loss
             
             global_step += 1
-            
-            begin = time.perf_counter()
 
-        if epoch % args.save_epochs == 0 and epoch != 0:
-            save_path = os.path.join(args.output_dir, f"checkpoint-{epoch}")
-            print(f'Saving in path {save_path}')
-            accelerator.save_state(save_path, safe_serialization=False) # ! https://github.com/tencent-ailab/IP-Adapter/issues/263
-            
+            if global_step % args.save_steps == 0:
+                print(f'-----Saving checkpoint at step {global_step}')
+                save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                accelerator.save_state(save_path, safe_serialization=False) 
+
+            begin = time.perf_counter()
+        
+        
+        mean_epoch_loss /= len(train_dataloader)
+        writer.add_scalar('epoch_loss', mean_epoch_loss, epoch-1)
+
+        # if epoch % args.save_epochs == 0 and epoch != 0:
+        #     save_path = os.path.join(args.output_dir, f"checkpoint-{epoch}")
+        #     print(f'Saving in path {save_path}')
+        #     accelerator.save_state(save_path, safe_serialization=False) # ! https://github.com/tencent-ailab/IP-Adapter/issues/263
+
+    print(f'-----Saving checkpoint at the end of training; step={global_step}')
+    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+    accelerator.save_state(save_path, safe_serialization=False)       
                 
 if __name__ == "__main__":
     main()    
