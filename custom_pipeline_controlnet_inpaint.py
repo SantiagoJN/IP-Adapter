@@ -697,6 +697,8 @@ class StableDiffusionControlNetInpaintPipeline(
         return extra_step_kwargs
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.get_timesteps
+    # ! Keep in mind that timesteps are computed in the default tutorial_train program like this:
+    # !     timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
     def get_timesteps(self, num_inference_steps, strength, device):
         # get the original timestep using init_timestep
         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)

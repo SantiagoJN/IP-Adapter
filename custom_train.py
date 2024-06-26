@@ -401,7 +401,8 @@ def main():
     """
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler") # load this for sampling the noise inside ip_adapter
     # load controlnet
-    controlnet_model_path = "/media/raid/santiagojn/IPAdapter/control_v11f1p_sd15_depth"
+    # controlnet_model_path = "/media/raid/santiagojn/IPAdapter/control_v11f1p_sd15_depth"
+    controlnet_model_path = "/media/raid/santiagojn/IPAdapter/controlnet-depth-sdxl-1.0"
     controlnet = ControlNetModel.from_pretrained(controlnet_model_path, torch_dtype=torch.float16)
 
     # noise scheduler

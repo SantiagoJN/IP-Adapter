@@ -415,6 +415,7 @@ class IPAdapterTRAIN(IPAdapter):
             # latents = self.pipe.vae.encode(kwargs["image"].to(self.device, dtype=torch.float32)).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
+        # * 2.1) Sampling here the noise so we directly pass the pipeline noisy_latents!
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
         bsz = latents.shape[0] # Batch size
@@ -426,8 +427,8 @@ class IPAdapterTRAIN(IPAdapter):
         # ! FOR DEBUGGING PURPOSES. REMOVE IT FOR ACTUAL TRAINING
         # ! FOR DEBUGGING PURPOSES. REMOVE IT FOR ACTUAL TRAINING
         # ! FOR DEBUGGING PURPOSES. REMOVE IT FOR ACTUAL TRAINING
-        timesteps = torch.randint(699, 700, (bsz,), device=latents.device)
-        timesteps = timesteps.long()
+        # timesteps = torch.randint(699, 700, (bsz,), device=latents.device)
+        # timesteps = timesteps.long()
 
         # Add noise to the latents according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
@@ -449,12 +450,15 @@ class IPAdapterTRAIN(IPAdapter):
             inference_timesteps=timesteps, # * Timestep at which we want to compute the noise_pred
             latents=noisy_latents, # * Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image generation
             strength=0.2, # ! Very careful with this value; if == 1, latents will be initialized to pure noise
+            # ? The `strength` parameter seems to be used in only two parts:
+            # ?    1) To compute the timesteps used to train, which we should get just random between 0 and 1
+            # ?    2) To check if it is maximum, in which case it ignores the conditioning of ip-adapter --> but we already pass the noisy latents, so it shouldn't compute anything anyways~~
             # callback_on_step_end=self.callback_function,
             # callback_on_step_end_tensor_inputs=["noise_pred", "noise"], # get the inner noise_pred!
             **kwargs,
         )
 
-        return noise, noise_pred, timesteps[0]
+        return noise, noise_pred, timesteps
 
 
 class IPAdapterXL(IPAdapter):
